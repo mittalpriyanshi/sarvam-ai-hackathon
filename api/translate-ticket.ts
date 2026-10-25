@@ -1,6 +1,11 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
-import busboy from 'busboy';
-import { unzipSync, strFromU8 } from 'fflate';
+/**
+ * POST /api/translate-ticket  — decode a ticket image or pasted text with Sarvam AI.
+ * GET  /api/translate-ticket  — report whether the server has a Sarvam key configured.
+ *
+ * Uses Vercel's Web-standard handler signature (Request → Response). This bypasses
+ * Vercel's Node "helpers", which pre-read the request body and break streaming
+ * multipart parsers; request.formData() parses the upload natively.
+ */
 
 /* ------------------------------------------------------------------ */
 /* Config                                                              */
@@ -10,8 +15,8 @@ const SARVAM_BASE = 'https://api.sarvam.ai';
 const CHAT_MODEL = 'sarvam-105b';
 const MAX_FILE_BYTES = 4 * 1024 * 1024; // Vercel caps request bodies at 4.5 MB
 const MAX_TEXT_CHARS = 8000;
-const TOTAL_BUDGET_MS = 56_000; // function maxDuration is 60 s
-const OCR_BUDGET_MS = 30_000;
+const TOTAL_BUDGET_MS = 56_000; // vercel.json sets maxDuration to 60 s
+const OCR_BUDGET_MS = 32_000;
 const POLL_INTERVAL_MS = 1500;
 
 // Output languages offered in the UI (Sarvam's 11 core languages).
@@ -29,7 +34,7 @@ const OUTPUT_LANGUAGES: Record<string, string> = {
   'te-IN': 'Telugu',
 };
 
-// Ticket (source) languages passed to Sarvam Vision / Document AI.
+// Ticket (source) languages passed to Sarvam Vision (BCP-47 codes).
 const TICKET_LANGUAGES = new Set([
   'en-IN', 'hi-IN', 'bn-IN', 'gu-IN', 'kn-IN', 'ml-IN', 'mr-IN', 'pa-IN', 'ta-IN', 'te-IN', 'ur-IN',
 ]);
@@ -56,15 +61,11 @@ class HttpError extends Error {
   }
 }
 
-function send(res: ServerResponse, status: number, body: unknown) {
-  res.statusCode = status;
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-store');
-  res.end(JSON.stringify(body));
-}
-
-function fail(res: ServerResponse, status: number, code: string, error: string) {
-  send(res, status, { success: false, code, error });
+function json(status: number, body: unknown, extraHeaders: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...extraHeaders },
+  });
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -82,136 +83,91 @@ async function fetchWithTimeout(url: string, init: RequestInit, ms: number): Pro
   }
 }
 
-function mapUpstream(status: number, stage: string): HttpError {
+/** Pull a short, non-sensitive error description out of a Sarvam error body. */
+async function upstreamDetail(res: Response): Promise<string> {
+  try {
+    const body = (await res.json()) as any;
+    const d = body?.detail ?? body?.error?.message ?? body?.title ?? body?.message;
+    return typeof d === 'string' ? d.slice(0, 200) : '';
+  } catch {
+    return '';
+  }
+}
+
+async function mapUpstream(res: Response, stage: string): Promise<HttpError> {
+  const status = res.status;
+  const detail = await upstreamDetail(res);
+  console.error(`[sarvam:${stage}] status ${status}`);
+  const suffix = detail ? ` (${detail})` : '';
   if (status === 401 || status === 403)
-    return new HttpError(502, 'AUTH', 'Sarvam AI rejected the server API key. Check SARVAM_API_KEY.');
+    return new HttpError(502, 'AUTH', `Sarvam AI rejected the server API key. Check SARVAM_API_KEY.${suffix}`);
+  if (status === 402)
+    return new HttpError(502, 'BILLING', `Your Sarvam account has no credits or access for ${stage}.${suffix}`);
   if (status === 429)
     return new HttpError(429, 'RATE_LIMIT', 'Sarvam AI rate limit reached. Wait a minute and retry.');
+  if (status === 413)
+    return new HttpError(413, 'FILE_TOO_LARGE', 'Sarvam AI says the image is too large.');
   if (status === 400 || status === 422)
-    return new HttpError(422, 'UPSTREAM_REJECTED', `Sarvam AI could not process this ticket (${stage}).`);
+    return new HttpError(422, 'UPSTREAM_REJECTED', `Sarvam AI could not process this ticket during ${stage}.${suffix}`);
   return new HttpError(502, 'UPSTREAM_ERROR', `Sarvam AI returned an error during ${stage}. Please retry.`);
 }
 
-function isJpeg(b: Buffer) {
+function isJpeg(b: Uint8Array) {
   return b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
 }
-function isPng(b: Buffer) {
+function isPng(b: Uint8Array) {
   return b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
 }
 
 /* ------------------------------------------------------------------ */
-/* Multipart parsing                                                   */
-/* ------------------------------------------------------------------ */
-
-interface ParsedForm {
-  fields: Record<string, string>;
-  file?: { buffer: Buffer; mime: string };
-}
-
-function parseMultipart(req: IncomingMessage): Promise<ParsedForm> {
-  return new Promise((resolve, reject) => {
-    const ct = req.headers['content-type'] || '';
-    if (!ct.includes('multipart/form-data')) {
-      reject(new HttpError(415, 'BAD_CONTENT_TYPE', 'Send the ticket as multipart/form-data.'));
-      return;
-    }
-    let bb: busboy.Busboy;
-    try {
-      bb = busboy({ headers: req.headers, limits: { fileSize: MAX_FILE_BYTES, files: 1, fields: 10, fieldSize: 64 * 1024 } });
-    } catch {
-      reject(new HttpError(400, 'BAD_FORM', 'Malformed upload.'));
-      return;
-    }
-    const fields: Record<string, string> = {};
-    let file: ParsedForm['file'];
-    let tooBig = false;
-
-    bb.on('field', (name, val) => {
-      fields[name] = val;
-    });
-    bb.on('file', (name, stream, info) => {
-      const chunks: Buffer[] = [];
-      stream.on('data', (d: Buffer) => chunks.push(d));
-      stream.on('limit', () => {
-        tooBig = true;
-      });
-      stream.on('end', () => {
-        if (name === 'file' && !tooBig) file = { buffer: Buffer.concat(chunks), mime: info.mimeType };
-      });
-    });
-    bb.on('error', () => reject(new HttpError(400, 'BAD_FORM', 'Malformed upload.')));
-    bb.on('close', () => {
-      if (tooBig) reject(new HttpError(413, 'FILE_TOO_LARGE', 'Image is larger than 4 MB.'));
-      else resolve({ fields, file });
-    });
-    req.pipe(bb);
-  });
-}
-
-/* ------------------------------------------------------------------ */
 /* Sarvam Vision (Document AI → Digitise)                             */
+/*   POST /doc-ai/v1/job/digitise          → { job_id, status }        */
+/*   GET  /doc-ai/v1/job/{id}/status       → { status }                */
+/*   GET  /doc-ai/v1/job/{id}/results?format=md                        */
+/*        → { documents: [{ pages: [{ page_number, content }] }] }     */
 /* ------------------------------------------------------------------ */
 
-async function digitiseImage(apiKey: string, img: { buffer: Buffer; mime: string }, language: string, deadline: number): Promise<string> {
+const TERMINAL = new Set(['completed', 'partially_completed', 'failed', 'rejected']);
+
+async function digitiseImage(apiKey: string, img: { bytes: Uint8Array; mime: string }, language: string, deadline: number): Promise<string> {
   const ext = img.mime === 'image/png' ? 'png' : 'jpg';
   const form = new FormData();
-  form.append('file', new Blob([new Uint8Array(img.buffer)], { type: img.mime }), `ticket.${ext}`);
+  form.append('file', new Blob([img.bytes as BlobPart], { type: img.mime }), `ticket.${ext}`);
   form.append('language', language);
-  form.append('output_format', 'md');
 
   const headers = { 'api-subscription-key': apiKey };
   const ocrDeadline = Math.min(deadline, Date.now() + OCR_BUDGET_MS);
 
   const created = await fetchWithTimeout(`${SARVAM_BASE}/doc-ai/v1/job/digitise`, { method: 'POST', headers, body: form }, ocrDeadline - Date.now());
-  if (!created.ok) {
-    console.error('[digitise:create] status', created.status);
-    throw mapUpstream(created.status, 'image reading');
-  }
-  const job = (await created.json()) as { job_id?: string };
+  if (!created.ok) throw await mapUpstream(created, 'image reading');
+  const job = (await created.json()) as { job_id?: string; status?: string };
   if (!job.job_id) throw new HttpError(502, 'UPSTREAM_ERROR', 'Sarvam AI did not return a job id.');
+  const jobUrl = `${SARVAM_BASE}/doc-ai/v1/job/${encodeURIComponent(job.job_id)}`;
 
-  // Poll until terminal.
-  let status = 'pending';
-  while (Date.now() < ocrDeadline) {
+  // Poll until the job reaches a terminal status.
+  let status = String(job.status || '').toLowerCase();
+  while (!TERMINAL.has(status)) {
+    if (Date.now() + POLL_INTERVAL_MS >= ocrDeadline)
+      throw new HttpError(504, 'TIMEOUT', 'Reading the image took too long. Try again or paste the text.');
     await sleep(POLL_INTERVAL_MS);
-    const st = await fetchWithTimeout(`${SARVAM_BASE}/doc-ai/v1/job/${job.job_id}/status`, { headers }, ocrDeadline - Date.now());
-    if (!st.ok) {
-      console.error('[digitise:status] status', st.status);
-      throw mapUpstream(st.status, 'image reading');
-    }
+    const st = await fetchWithTimeout(`${jobUrl}/status`, { headers }, ocrDeadline - Date.now());
+    if (!st.ok) throw await mapUpstream(st, 'image reading');
     status = String(((await st.json()) as { status?: string }).status || '').toLowerCase();
-    if (['completed', 'partially_completed', 'failed', 'rejected'].includes(status)) break;
   }
   if (status === 'failed' || status === 'rejected')
     throw new HttpError(422, 'OCR_FAILED', 'Sarvam Vision could not read this image. Try a clearer photo or paste the text.');
-  if (status !== 'completed' && status !== 'partially_completed')
-    throw new HttpError(504, 'TIMEOUT', 'Reading the image took too long. Try again or paste the text.');
 
-  const dlMeta = await fetchWithTimeout(`${SARVAM_BASE}/doc-ai/v1/job/${job.job_id}/download-url`, { headers }, deadline - Date.now());
-  if (!dlMeta.ok) {
-    console.error('[digitise:download-url] status', dlMeta.status);
-    throw mapUpstream(dlMeta.status, 'image reading');
-  }
-  const { url } = (await dlMeta.json()) as { url?: string };
-  if (!url) throw new HttpError(502, 'UPSTREAM_ERROR', 'Sarvam AI did not return a download link.');
+  const resultsRes = await fetchWithTimeout(`${jobUrl}/results?format=md`, { headers }, deadline - Date.now());
+  if (!resultsRes.ok) throw await mapUpstream(resultsRes, 'image reading');
+  const results = (await resultsRes.json()) as { documents?: { pages?: { page_number?: number; content?: unknown }[] }[] };
 
-  const zipRes = await fetchWithTimeout(url, {}, deadline - Date.now());
-  if (!zipRes.ok) throw new HttpError(502, 'UPSTREAM_ERROR', 'Could not download the read-out from Sarvam AI.');
-  const bytes = new Uint8Array(await zipRes.arrayBuffer());
+  const pages = (results.documents ?? []).flatMap((d) => d.pages ?? []);
+  pages.sort((a, b) => (a.page_number ?? 0) - (b.page_number ?? 0));
+  const text = pages
+    .map((p) => (typeof p.content === 'string' ? p.content : p.content ? JSON.stringify(p.content) : ''))
+    .join('\n\n')
+    .trim();
 
-  // Output is a ZIP containing the markdown file plus metadata JSON.
-  let text = '';
-  try {
-    const files = unzipSync(bytes);
-    const md = Object.entries(files)
-      .filter(([name]) => name.toLowerCase().endsWith('.md'))
-      .sort((a, b) => b[1].length - a[1].length)[0];
-    if (md) text = strFromU8(md[1]);
-  } catch {
-    // Not a zip — some responses may be the raw file.
-    text = strFromU8(bytes);
-  }
-  text = text.trim();
   if (!text) throw new HttpError(422, 'OCR_EMPTY', 'No readable text was found on this image. Try a sharper photo or paste the text.');
   return text.slice(0, MAX_TEXT_CHARS);
 }
@@ -246,9 +202,13 @@ Return ONLY a JSON object, no markdown, with exactly this shape:
   "checklist": [{ "item": string, "basis": "ticket" | "suggestion" }],
   "translation": [{ "original": string, "translated": string }],
   "uncertainFields": [string],
-  "summary": "<2-4 sentence plain-language summary in ${targetLanguage}>"
+  "summary": "<2-4 sentence plain-language summary in ${targetLanguage}>",
+  "spokenScript": "<what a helpful friend would SAY aloud in ${targetLanguage}, max 900 characters>"
 }
-"note" is a short plain-language explanation in ${targetLanguage} (e.g. what a class code means), or null.`;
+"note" is a short plain-language explanation in ${targetLanguage} (e.g. what a class code means), or null.
+"spokenScript" will be read aloud by text-to-speech: natural spoken ${targetLanguage}, no symbols, bullets, markdown or emojis.
+Cover where and when they travel, train/bus number, coach and seat, booking status, then the most important things to do.
+Write times in words people say (e.g. "8:05 in the evening"), read codes letter by letter, and only use facts present on the ticket.`;
 }
 
 function extractJson(content: string): unknown {
@@ -263,26 +223,15 @@ function extractJson(content: string): unknown {
       try {
         return JSON.parse(s.slice(start, end + 1));
       } catch {
-        /* fallthrough */
+        /* fall through */
       }
     }
   }
   return null;
 }
 
-async function explainTicket(apiKey: string, ticketText: string, targetLanguage: string, deadline: number): Promise<unknown> {
-  const body = {
-    model: CHAT_MODEL,
-    messages: [
-      { role: 'system', content: buildPrompt(targetLanguage) },
-      { role: 'user', content: `TICKET TEXT (verbatim):\n"""\n${ticketText}\n"""` },
-    ],
-    temperature: 0.1,
-    max_tokens: 4096,
-    reasoning_effort: null,
-    response_format: { type: 'json_object' },
-  };
-  const res = await fetchWithTimeout(
+async function callChat(apiKey: string, body: Record<string, unknown>, deadline: number) {
+  return fetchWithTimeout(
     `${SARVAM_BASE}/v1/chat/completions`,
     {
       method: 'POST',
@@ -295,16 +244,40 @@ async function explainTicket(apiKey: string, ticketText: string, targetLanguage:
     },
     deadline - Date.now(),
   );
-  if (!res.ok) {
-    console.error('[chat] status', res.status);
-    throw mapUpstream(res.status, 'translation');
+}
+
+async function explainTicket(apiKey: string, ticketText: string, targetLanguage: string, deadline: number): Promise<unknown> {
+  const body: Record<string, unknown> = {
+    model: CHAT_MODEL,
+    messages: [
+      { role: 'system', content: buildPrompt(targetLanguage) },
+      { role: 'user', content: `TICKET TEXT (verbatim):\n"""\n${ticketText}\n"""` },
+    ],
+    temperature: 0.1,
+    max_tokens: 4096,
+    // Reasoning is on by default and its tokens count against max_tokens; null disables it.
+    reasoning_effort: null,
+    response_format: { type: 'json_object' },
+  };
+
+  let res = await callChat(apiKey, body, deadline);
+  // If the model/plan rejects JSON mode, retry once without it (the prompt already demands JSON only).
+  if (res.status === 400 || res.status === 422) {
+    console.error(`[sarvam:translation] status ${res.status}, retrying without response_format`);
+    delete body.response_format;
+    res = await callChat(apiKey, body, deadline);
   }
+  if (!res.ok) throw await mapUpstream(res, 'translation');
+
   const data = (await res.json()) as { choices?: { message?: { content?: string | null }; finish_reason?: string }[] };
-  const content = data.choices?.[0]?.message?.content;
+  const choice = data.choices?.[0];
+  const content = choice?.message?.content;
   if (!content) throw new HttpError(502, 'MALFORMED_AI_OUTPUT', 'The AI returned an empty answer. Please retry.');
   const parsed = extractJson(content);
-  if (!parsed || typeof parsed !== 'object')
-    throw new HttpError(502, 'MALFORMED_AI_OUTPUT', 'The AI answer was not valid JSON. Please retry.');
+  if (!parsed || typeof parsed !== 'object') {
+    const cut = choice?.finish_reason === 'length' ? ' It was cut off before finishing.' : '';
+    throw new HttpError(502, 'MALFORMED_AI_OUTPUT', `The AI answer was not valid JSON.${cut} Please retry.`);
+  }
   return parsed;
 }
 
@@ -320,7 +293,7 @@ const str = (v: unknown, max = 500): string | null => {
   return t.slice(0, max);
 };
 const arr = (v: unknown, max = 20): unknown[] => (Array.isArray(v) ? v.slice(0, max) : []);
-const norm = (s: string) => s.toLowerCase().replace(/[\s\-_/.,:]+/g, '');
+const norm = (s: string) => s.toLowerCase().replace(/[\s\-_/.,:|*]+/g, '');
 
 function validate(raw: any, sourceText: string) {
   const types = ['train', 'bus', 'flight', 'event', 'unknown'];
@@ -331,12 +304,16 @@ function validate(raw: any, sourceText: string) {
 
   for (const k of FIELD_KEYS) {
     const f = raw?.fields?.[k];
-    let value = str(typeof f === 'object' && f !== null ? f.value : f, 200);
-    const note = typeof f === 'object' && f !== null ? str(f.note, 300) : null;
+    const isObj = typeof f === 'object' && f !== null;
+    let value = str(isObj ? f.value : f, 200);
+    const note = isObj ? str(f.note, 300) : null;
     // Guard against invented values: strict fields must appear in the ticket text.
-    if (value && STRICT_FIELDS.includes(k) && !normalizedSource.includes(norm(value))) {
-      value = null;
-      uncertain.add(k);
+    if (value && STRICT_FIELDS.includes(k)) {
+      const nv = norm(value);
+      if (!nv || !normalizedSource.includes(nv)) {
+        value = null;
+        uncertain.add(k);
+      }
     }
     fields[k] = { value, note: value ? note : null };
   }
@@ -360,62 +337,80 @@ function validate(raw: any, sourceText: string) {
       .filter((t) => t.original && t.translated),
     uncertainFields: [...uncertain],
     summary: str(raw?.summary, 1200) ?? '',
+    spokenScript: str(raw?.spokenScript, 2000) ?? '',
   };
 }
 
 /* ------------------------------------------------------------------ */
-/* Handler                                                             */
+/* Handlers                                                            */
 /* ------------------------------------------------------------------ */
 
-export default async function handler(req: IncomingMessage, res: ServerResponse) {
-  const apiKey = process.env.SARVAM_API_KEY?.trim();
+const apiKey = () => process.env.SARVAM_API_KEY?.trim() || '';
 
-  if (req.method === 'GET') {
-    send(res, 200, { configured: Boolean(apiKey), outputLanguages: OUTPUT_LANGUAGES });
-    return;
-  }
-  if (req.method !== 'POST') {
-    res.setHeader('Allow', 'GET, POST');
-    fail(res, 405, 'METHOD_NOT_ALLOWED', 'Use POST.');
-    return;
-  }
+export function GET(): Response {
+  return json(200, { configured: Boolean(apiKey()), outputLanguages: OUTPUT_LANGUAGES });
+}
 
+export async function POST(request: Request): Promise<Response> {
   const deadline = Date.now() + TOTAL_BUDGET_MS;
   try {
-    const { fields, file } = await parseMultipart(req);
-    const targetCode = fields.targetLanguage || '';
-    const ticketLang = fields.ticketLanguage || 'en-IN';
-    const pasted = (fields.text || '').trim();
+    const ct = request.headers.get('content-type') || '';
+    if (!ct.toLowerCase().startsWith('multipart/form-data'))
+      throw new HttpError(415, 'BAD_CONTENT_TYPE', 'Send the ticket as multipart/form-data.');
+    const declared = Number(request.headers.get('content-length') || 0);
+    if (declared > MAX_FILE_BYTES + 256 * 1024) throw new HttpError(413, 'FILE_TOO_LARGE', 'Image is larger than 4 MB.');
+
+    let form: FormData;
+    try {
+      form = await request.formData();
+    } catch {
+      throw new HttpError(400, 'BAD_FORM', 'Malformed upload.');
+    }
+
+    const field = (name: string) => {
+      const v = form.get(name);
+      return typeof v === 'string' ? v : '';
+    };
+    const targetCode = field('targetLanguage');
+    const ticketLang = field('ticketLanguage') || 'en-IN';
+    const pasted = field('text').trim();
+    const fileEntry = form.get('file');
+    const file = fileEntry && typeof fileEntry !== 'string' ? (fileEntry as Blob) : null;
 
     if (!OUTPUT_LANGUAGES[targetCode]) throw new HttpError(400, 'BAD_LANGUAGE', 'Unsupported target language.');
     if (!TICKET_LANGUAGES.has(ticketLang)) throw new HttpError(400, 'BAD_LANGUAGE', 'Unsupported ticket language.');
     if (!file && !pasted) throw new HttpError(400, 'NO_INPUT', 'Upload a ticket image or paste the ticket text.');
     if (pasted.length > MAX_TEXT_CHARS) throw new HttpError(413, 'TEXT_TOO_LONG', `Pasted text is over ${MAX_TEXT_CHARS} characters.`);
-    if (file) {
-      if (!file.buffer.length) throw new HttpError(400, 'EMPTY_FILE', 'The uploaded file is empty.');
-      const okType = (file.mime === 'image/jpeg' && isJpeg(file.buffer)) || (file.mime === 'image/png' && isPng(file.buffer));
-      if (!okType) throw new HttpError(415, 'BAD_FILE_TYPE', 'Upload a JPG, PNG or WEBP image.');
-    }
-    if (!apiKey) throw new HttpError(503, 'NOT_CONFIGURED', 'Live decoding is not configured on this server yet. Try the sample ticket.');
 
-    const sourceText = file ? await digitiseImage(apiKey, file, ticketLang, deadline) : pasted;
-    const raw = await explainTicket(apiKey, sourceText, OUTPUT_LANGUAGES[targetCode], deadline);
+    let image: { bytes: Uint8Array; mime: string } | null = null;
+    if (file) {
+      if (file.size === 0) throw new HttpError(400, 'EMPTY_FILE', 'The uploaded file is empty.');
+      if (file.size > MAX_FILE_BYTES) throw new HttpError(413, 'FILE_TOO_LARGE', 'Image is larger than 4 MB.');
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const mime = isJpeg(bytes) ? 'image/jpeg' : isPng(bytes) ? 'image/png' : '';
+      if (!mime) throw new HttpError(415, 'BAD_FILE_TYPE', 'Upload a JPG, PNG or WEBP image.');
+      image = { bytes, mime };
+    }
+
+    const key = apiKey();
+    if (!key) throw new HttpError(503, 'NOT_CONFIGURED', 'Live decoding is not configured on this server yet. Try the sample ticket.');
+
+    const sourceText = image ? await digitiseImage(key, image, ticketLang, deadline) : pasted;
+    const raw = await explainTicket(key, sourceText, OUTPUT_LANGUAGES[targetCode], deadline);
     const result = validate(raw, sourceText);
 
-    send(res, 200, {
+    return json(200, {
       success: true,
       mode: 'live',
-      input: file ? 'image' : 'text',
+      input: image ? 'image' : 'text',
       targetLanguage: OUTPUT_LANGUAGES[targetCode],
+      targetLanguageCode: targetCode,
       sourceText,
       ...result,
     });
   } catch (e) {
-    if (e instanceof HttpError) {
-      fail(res, e.status, e.code, e.message);
-    } else {
-      console.error('[translate-ticket] unexpected error', (e as Error)?.name);
-      fail(res, 500, 'INTERNAL', 'Something went wrong. Please try again.');
-    }
+    if (e instanceof HttpError) return json(e.status, { success: false, code: e.code, error: e.message });
+    console.error('[translate-ticket] unexpected error', (e as Error)?.name);
+    return json(500, { success: false, code: 'INTERNAL', error: 'Something went wrong. Please try again.' });
   }
 }

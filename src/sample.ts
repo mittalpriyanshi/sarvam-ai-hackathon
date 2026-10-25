@@ -21,7 +21,10 @@ export const SAMPLE_RESULT: TicketResult = {
   ticketType: 'train',
   sourceLanguage: 'English, Hindi',
   targetLanguage: 'English',
+  targetLanguageCode: 'en-IN',
   sourceText: SAMPLE_TICKET_TEXT,
+  spokenScript:
+    'This is a sample ticket. You are travelling on train 12560, the Shiv Ganga Express, from New Delhi to Banaras. It leaves on 14 November 2026 at 8:05 in the evening and reaches the next morning at 8:15. Your seat is confirmed: coach B 4, lower berth 23, in AC three tier. The platform is not printed on the ticket, so check it at the station. Remember to carry your original photo ID.',
   fields: {
     travellerName: { value: 'A K YADAV', note: 'Male, 21' },
     origin: { value: 'NEW DELHI (NDLS)', note: 'Board here — NDLS is the station code.' },

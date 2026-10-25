@@ -4,6 +4,11 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/translate-ticket.ts": { "maxDuration": 60 }
+    "api/translate-ticket.ts": {
+      "maxDuration": 60
+    },
+    "api/speak.ts": {
+      "maxDuration": 30
+    }
   }
 }

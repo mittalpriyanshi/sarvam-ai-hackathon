@@ -8,16 +8,19 @@
 Browser ──multipart──▶ POST /api/translate-ticket (Vercel function)
                           │
                           ├─ image → Sarvam Vision (Document AI "Digitise", model sarvam-vision)
-                          │           POST /doc-ai/v1/job/digitise → poll /status → /download-url → unzip markdown
+                          │           POST /doc-ai/v1/job/digitise → poll /status → GET /results?format=md
                           │
                           └─ text  → Sarvam chat completions (sarvam-105b, JSON mode)
                                       → schema validation + anti-hallucination checks → JSON to UI
+
+"Listen" button ──JSON──▶ POST /api/speak → Sarvam text-to-speech (bulbul:v3, voices Shubh / Priya) → MP3 played in the browser
 ```
 
 **Never invents details.** Booking reference, seat, coach, platform, train number and times must appear verbatim in the text read from the ticket; anything the model returns that isn't there is dropped and flagged under "Double-check these". Checklist items are tagged **On ticket** vs **Suggested**.
 
 - WEBP and large images are re-encoded to JPEG in the browser (Sarvam Vision takes JPG/PNG; Vercel caps request bodies at 4.5 MB).
-- Nothing is stored or logged; only upstream HTTP status codes are logged.
+- The function uses Vercel's Web-standard handler (`export async function POST(request: Request)`) and `request.formData()`, so uploads are parsed natively.
+- Nothing is stored; only upstream HTTP status codes are logged. Sarvam's own error text is shown in the UI to make debugging easier.
 - The API key lives only in the server-side env var `SARVAM_API_KEY`.
 - Without a key the app still builds and runs; the **sample ticket** demo is clearly labelled as sample data.
 
@@ -51,6 +54,8 @@ npm run build
 ## API
 
 `GET /api/translate-ticket` → `{ configured: boolean, outputLanguages }`
+
+`POST /api/speak` (JSON `{ text, language, voice }`) → `{ success, audio (base64), mime }`. `voice` is `shubh` or `priya`; all 11 output languages are supported.
 
 `POST /api/translate-ticket` (multipart/form-data)
 

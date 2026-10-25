@@ -17,6 +17,7 @@ export interface TicketResult {
   ticketType: 'train' | 'bus' | 'flight' | 'event' | 'unknown';
   sourceLanguage: string;
   targetLanguage: string;
+  targetLanguageCode: string;
   sourceText: string;
   fields: Record<FieldKey, FieldValue>;
   abbreviations: { term: string; meaning: string }[];
@@ -25,6 +26,7 @@ export interface TicketResult {
   translation: { original: string; translated: string }[];
   uncertainFields: string[];
   summary: string;
+  spokenScript: string;
 }
 
 export interface ApiError {

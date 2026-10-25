@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle, ArrowRight, BookOpen, Check, CheckCircle2, ClipboardCopy, FileText, ImageUp,
-  Info, Languages, Loader2, RotateCcw, ScanText, Sparkles, Ticket, X,
+  Info, Languages, Loader2, Pause, Play, RotateCcw, ScanText, Sparkles, Ticket, Volume2, X,
 } from 'lucide-react';
 import { ACCEPTED_TYPES, MAX_UPLOAD_BYTES, formatBytes, prepareImage } from './image';
 import { SAMPLE_RESULT } from './sample';
@@ -390,7 +390,121 @@ async function copyText(s: string) {
   }
 }
 
-function ResultView({ result: r, onStartOver }: { result: TicketResult; onStartOver: () => void }) {
+type VoiceState = 'idle' | 'loading' | 'ready' | 'playing' | 'paused' | 'error';
+const VOICES = [
+  { id: 'shubh', label: 'Shubh' },
+  { id: 'priya', label: 'Priya' },
+] as const;
+
+/** Reads the decoded ticket aloud via /api/speak (Sarvam Bulbul text-to-speech). */
+function ListenBar({ text, languageCode, languageLabel }: { text: string; languageCode: string; languageLabel: string }) {
+  const [voice, setVoice] = useState<string>('shubh');
+  const [state, setState] = useState<VoiceState>('idle');
+  const [err, setErr] = useState<string | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const cache = useRef<Record<string, string>>({}); // voice → object URL
+
+  useEffect(() => {
+    const urls = cache.current;
+    return () => {
+      audioRef.current?.pause();
+      Object.values(urls).forEach((u) => URL.revokeObjectURL(u));
+    };
+  }, []);
+
+  const startAudio = async (url: string) => {
+    audioRef.current?.pause();
+    const audio = new Audio(url);
+    audioRef.current = audio;
+    audio.onended = () => setState('idle');
+    audio.onerror = () => { setErr('Your browser could not play this audio.'); setState('error'); };
+    try {
+      await audio.play();
+      setState('playing');
+    } catch {
+      // Some browsers block playback that starts after a network wait; the next tap plays instantly from cache.
+      setState('ready');
+    }
+  };
+
+  const onPress = async () => {
+    setErr(null);
+    const a = audioRef.current;
+    if (state === 'playing' && a) { a.pause(); setState('paused'); return; }
+    if (state === 'paused' && a) { await a.play(); setState('playing'); return; }
+    if (state === 'loading') return;
+
+    let url = cache.current[voice];
+    if (!url) {
+      setState('loading');
+      try {
+        const res = await fetch('/api/speak', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text, language: languageCode, voice }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.audio) throw new Error(data?.error || `Voice request failed (${res.status}).`);
+        const bytes = Uint8Array.from(atob(data.audio), (c) => c.charCodeAt(0));
+        url = URL.createObjectURL(new Blob([bytes], { type: data.mime || 'audio/mpeg' }));
+        cache.current[voice] = url;
+      } catch (e) {
+        setErr((e as Error).message || 'Could not generate speech.');
+        setState('error');
+        return;
+      }
+    }
+    await startAudio(url);
+  };
+
+  const changeVoice = (v: string) => {
+    audioRef.current?.pause();
+    audioRef.current = null;
+    setVoice(v);
+    setErr(null);
+    setState('idle');
+  };
+
+  const label =
+    state === 'loading' ? 'Preparing audio…'
+    : state === 'playing' ? 'Pause'
+    : state === 'paused' ? 'Resume'
+    : state === 'ready' ? 'Audio ready — tap to play'
+    : `Listen in ${languageLabel}`;
+  const Icon = state === 'loading' ? Loader2 : state === 'playing' ? Pause : state === 'paused' || state === 'ready' ? Play : Volume2;
+
+  return (
+    <section aria-label="Listen to your ticket" className="mb-4 rounded-3xl bg-teal-50 p-4 ring-1 ring-teal-100 sm:p-5">
+      <div className="flex flex-wrap items-center gap-3">
+        <button
+          onClick={onPress}
+          disabled={!text || state === 'loading'}
+          aria-pressed={state === 'playing'}
+          className="flex flex-1 items-center justify-center gap-2 rounded-2xl bg-teal-600 px-5 py-3.5 text-base font-bold text-white shadow-card transition hover:bg-teal-700 disabled:opacity-60 sm:flex-none"
+        >
+          <Icon className={`h-5 w-5 ${state === 'loading' ? 'animate-spin' : ''}`} aria-hidden /> {label}
+        </button>
+        <div className="flex items-center gap-2">
+          <label htmlFor="voice" className="text-sm font-semibold text-navy-700">Voice</label>
+          <select
+            id="voice" value={voice} onChange={(e) => changeVoice(e.target.value)}
+            className="rounded-xl border border-teal-100 bg-white px-3 py-2 text-sm font-medium text-navy-900 focus:border-teal-500 focus:outline-none"
+          >
+            {VOICES.map((v) => <option key={v.id} value={v.id}>{v.label}</option>)}
+          </select>
+        </div>
+        <p className="w-full text-xs text-teal-700 sm:w-auto sm:flex-1 sm:text-right">Spoken by Sarvam AI · Bulbul</p>
+      </div>
+      {err && (
+        <p role="alert" className="mt-3 flex items-start gap-2 text-sm text-red-700">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden /> {err}
+        </p>
+      )}
+    </section>
+  );
+}
+
+export function ResultView({ result: r, onStartOver }: { result: TicketResult; onStartOver: () => void }) {
   const [done, setDone] = useState<Set<number>>(new Set());
   const [copied, setCopied] = useState(false);
   const f = r.fields;
@@ -436,6 +550,12 @@ function ResultView({ result: r, onStartOver }: { result: TicketResult; onStartO
           </button>
         </div>
       </div>
+
+      <ListenBar
+        text={r.spokenScript || r.summary}
+        languageCode={r.targetLanguageCode || OUTPUT_LANGUAGES.find((l) => l.label === r.targetLanguage)?.code || 'en-IN'}
+        languageLabel={r.targetLanguage}
+      />
 
       {/* Boarding-pass style hero */}
       <article className="overflow-hidden rounded-3xl bg-white shadow-card ring-1 ring-navy-100">
