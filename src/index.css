@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+body {
+  @apply bg-navy-50 text-navy-900 font-sans antialiased;
+}
+:focus-visible {
+  @apply outline-none ring-2 ring-teal-500 ring-offset-2 ring-offset-navy-50;
+}
+.ticket-edge {
+  background-image: radial-gradient(circle at 0 50%, transparent 9px, white 10px), radial-gradient(circle at 100% 50%, transparent 9px, white 10px);
+}
