@@ -100,7 +100,7 @@ async function mapUpstream(res: Response, stage: string): Promise<HttpError> {
   console.error(`[sarvam:${stage}] status ${status}`);
   const suffix = detail ? ` (${detail})` : '';
   if (status === 401 || status === 403)
-    return new HttpError(502, 'AUTH', `Sarvam AI rejected the server API key. Check SARVAM_API_KEY.${suffix}`);
+    return new HttpError(502, 'AUTH', `Sarvam AI rejected the API key during ${stage}. Check SARVAM_API_KEY.${suffix}`);
   if (status === 402)
     return new HttpError(502, 'BILLING', `Your Sarvam account has no credits or access for ${stage}.${suffix}`);
   if (status === 429)
@@ -231,19 +231,18 @@ function extractJson(content: string): unknown {
 }
 
 async function callChat(apiKey: string, body: Record<string, unknown>, deadline: number) {
-  return fetchWithTimeout(
-    `${SARVAM_BASE}/v1/chat/completions`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-        'api-subscription-key': apiKey,
-      },
-      body: JSON.stringify(body),
-    },
-    deadline - Date.now(),
-  );
+  const send = (auth: Record<string, string>) =>
+    fetchWithTimeout(
+      `${SARVAM_BASE}/v1/chat/completions`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json', ...auth }, body: JSON.stringify(body) },
+      deadline - Date.now(),
+    );
+  // Sarvam subscription keys (sk_…) authenticate via the api-subscription-key header.
+  const res = await send({ 'api-subscription-key': apiKey });
+  if (res.status !== 401 && res.status !== 403) return res;
+  // Fall back to bearer auth in case this endpoint/account expects it.
+  console.error(`[sarvam:translation] status ${res.status} with api-subscription-key, retrying with bearer auth`);
+  return send({ Authorization: `Bearer ${apiKey}` });
 }
 
 async function explainTicket(apiKey: string, ticketText: string, targetLanguage: string, deadline: number): Promise<unknown> {
@@ -345,7 +344,8 @@ function validate(raw: any, sourceText: string) {
 /* Handlers                                                            */
 /* ------------------------------------------------------------------ */
 
-const apiKey = () => process.env.SARVAM_API_KEY?.trim() || '';
+// Tolerate keys pasted with surrounding quotes or whitespace in the Vercel dashboard.
+const apiKey = () => (process.env.SARVAM_API_KEY || '').trim().replace(/^['"]+|['"]+$/g, '').trim();
 
 export function GET(): Response {
   return json(200, { configured: Boolean(apiKey()), outputLanguages: OUTPUT_LANGUAGES });

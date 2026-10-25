@@ -50,7 +50,7 @@ export async function POST(request: Request): Promise<Response> {
   if (!text) return fail(400, 'NO_TEXT', 'Nothing to read aloud.');
   if (!LANGUAGES.has(language)) return fail(400, 'BAD_LANGUAGE', 'Voice is not available for this language.');
 
-  const apiKey = process.env.SARVAM_API_KEY?.trim();
+  const apiKey = (process.env.SARVAM_API_KEY || '').trim().replace(/^['"]+|['"]+$/g, '').trim();
   if (!apiKey) return fail(503, 'NOT_CONFIGURED', 'Voice needs the Sarvam API key to be configured on the server.');
 
   let res: Response;
@@ -84,7 +84,7 @@ export async function POST(request: Request): Promise<Response> {
     } catch {
       /* ignore */
     }
-    if (res.status === 401 || res.status === 403) return fail(502, 'AUTH', `Sarvam AI rejected the server API key.${detail}`);
+    if (res.status === 401 || res.status === 403) return fail(502, 'AUTH', `Sarvam AI rejected the API key during speech. Check SARVAM_API_KEY.${detail}`);
     if (res.status === 429) return fail(429, 'RATE_LIMIT', 'Sarvam AI rate limit reached. Wait a minute and retry.');
     if (res.status === 400 || res.status === 422) return fail(422, 'UPSTREAM_REJECTED', `Sarvam AI could not voice this text.${detail}`);
     return fail(502, 'UPSTREAM_ERROR', 'Sarvam AI returned an error while generating speech. Please retry.');

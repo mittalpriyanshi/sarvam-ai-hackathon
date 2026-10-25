@@ -13,7 +13,7 @@ type Tab = 'image' | 'text';
 export default function App() {
   const [configured, setConfigured] = useState<boolean | null>(null);
   const [phase, setPhase] = useState<Phase>('input');
-  const [tab, setTab] = useState<Tab>('image');
+  const [tab, setTab] = useState<Tab>('text');
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [text, setText] = useState('');
@@ -197,7 +197,7 @@ function InputPanel(p: InputPanelProps) {
   return (
     <section className="mx-auto max-w-2xl rounded-3xl bg-white p-4 shadow-card ring-1 ring-navy-100 sm:p-6">
       <div role="tablist" aria-label="Input method" className="mb-4 grid grid-cols-2 gap-1 rounded-xl bg-navy-50 p-1">
-        {([['image', 'Upload image', ImageUp], ['text', 'Paste text', FileText]] as const).map(([key, label, Icon]) => (
+        {([['text', 'Paste text', FileText], ['image', 'Upload image', ImageUp]] as const).map(([key, label, Icon]) => (
           <button
             key={key} role="tab" aria-selected={p.tab === key} onClick={() => p.setTab(key)}
             className={`flex items-center justify-center gap-2 rounded-lg py-2 text-sm font-semibold transition ${p.tab === key ? 'bg-white text-navy-950 shadow-sm' : 'text-navy-500 hover:text-navy-800'}`}
